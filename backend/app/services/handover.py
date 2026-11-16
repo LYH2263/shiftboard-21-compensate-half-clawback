@@ -12,6 +12,33 @@ def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def active_doc(conn) -> dict | None:
+    """全局互斥的唯一口径：任一时间最多一单进行中的正向交班或补偿回拨。
+
+    返回 {"kind", "doc_no", "id"}；没有进行中单据时返回 None。
+    补偿与交班的各入口都必须在 BEGIN IMMEDIATE 事务内调用本函数。
+    """
+    active_handover = conn.execute(
+        "SELECT id FROM handovers WHERE status = '进行中' LIMIT 1"
+    ).fetchone()
+    if active_handover:
+        return {
+            "kind": "正向交班",
+            "id": active_handover["id"],
+            "doc_no": f"交班单#{active_handover['id']}",
+        }
+    active_comp = conn.execute(
+        "SELECT id FROM compensations WHERE status = '进行中' LIMIT 1"
+    ).fetchone()
+    if active_comp:
+        return {
+            "kind": "补偿回拨",
+            "id": active_comp["id"],
+            "doc_no": f"补偿单#{active_comp['id']}",
+        }
+    return None
+
+
 def list_shifts() -> list[dict]:
     with connect() as conn:
         return rows_to_dicts(conn.execute("SELECT * FROM shifts ORDER BY id").fetchall())
@@ -133,18 +160,15 @@ def start_handover(from_shift_id: int, to_shift_id: int) -> dict:
         ts = conn.execute("SELECT * FROM shifts WHERE id = ?", (to_shift_id,)).fetchone()
         if not fs or not ts:
             raise HTTPException(404, "班次不存在")
-        active = conn.execute(
-            "SELECT id FROM handovers WHERE status = '进行中' LIMIT 1"
-        ).fetchone()
+        active = active_doc(conn)
         if active:
-            raise HTTPException(409, f"已有进行中的交班单#{active['id']}，禁止并行交班")
-        active_comp = conn.execute(
-            "SELECT id FROM compensations WHERE status = '进行中' LIMIT 1"
-        ).fetchone()
-        if active_comp:
+            if active["kind"] == "正向交班":
+                raise HTTPException(
+                    409, f"已有进行中的{active['doc_no']}，禁止并行交班"
+                )
             raise HTTPException(
                 409,
-                f"补偿单#{active_comp['id']} 正在进行中，禁止同时发起正向交班",
+                f"{active['doc_no']} 正在进行中，禁止同时发起正向交班",
             )
         batches = conn.execute(
             "SELECT id FROM batches WHERE owner_shift_id = ? AND status = '在途' ORDER BY id",
@@ -177,13 +201,11 @@ def complete_handover(handover_id: int) -> dict:
             raise HTTPException(404, "交班单不存在")
         if h["status"] != "进行中":
             raise HTTPException(400, "只能完成进行中的交班单")
-        active_comp = conn.execute(
-            "SELECT id FROM compensations WHERE status = '进行中' LIMIT 1"
-        ).fetchone()
-        if active_comp:
+        active = active_doc(conn)
+        if active and active["kind"] == "补偿回拨":
             raise HTTPException(
                 409,
-                f"补偿单#{active_comp['id']} 正在进行中，禁止同时完成正向交班",
+                f"{active['doc_no']} 正在进行中，禁止同时完成正向交班",
             )
         items = conn.execute(
             "SELECT batch_id FROM handover_items WHERE handover_id = ?",

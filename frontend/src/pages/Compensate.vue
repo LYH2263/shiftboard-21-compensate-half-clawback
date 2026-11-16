@@ -223,18 +223,64 @@ onMounted(async () => {
       <div v-if="expanded" style="margin-top: 14px">
         <h2>补偿单 #{{ expanded.id }} 清单</h2>
         <table>
-          <thead><tr><th>业务键</th><th>标题</th><th>回拨前归属</th><th>当前归属</th><th>批次状态</th></tr></thead>
+          <thead><tr><th>业务键</th><th>标题</th><th>回拨前归属</th><th>回拨后归属</th><th>当前归属</th><th>批次状态</th></tr></thead>
           <tbody>
             <tr v-for="i in expanded.items" :key="i.batch_id">
               <td>{{ i.biz_key }}</td>
               <td>{{ i.title }}</td>
               <td>#{{ i.owner_shift_id_before }}</td>
+              <td>{{ i.owner_shift_id_after ? '#' + i.owner_shift_id_after : '—' }}</td>
               <td>#{{ i.owner_shift_id_now }}</td>
               <td>{{ i.batch_status }}</td>
             </tr>
           </tbody>
         </table>
         <p v-if="expanded.reason" class="msg">{{ expanded.reason }}</p>
+
+        <div v-if="expanded.proof" class="proof">
+          <h2>补偿前后在途差证明（与批次归属同源）</h2>
+          <p class="muted">
+            证明单号：{{ expanded.doc_no }} · 关联 {{ expanded.related_doc_no }}
+            · 回拨方（接班方）#{{ expanded.proof.from_shift_id }} → 接收方（原交班方）#{{ expanded.proof.to_shift_id }}
+          </p>
+          <table>
+            <thead><tr><th>差证明字段</th><th>业务键集合</th></tr></thead>
+            <tbody>
+              <tr>
+                <td>回拨键集合</td>
+                <td>{{ expanded.proof.moved_biz_keys.join('、') || '—' }}</td>
+              </tr>
+              <tr>
+                <td>接班方不再持有</td>
+                <td>{{ expanded.proof.removed_from_holder.join('、') || '—' }}</td>
+              </tr>
+              <tr>
+                <td>原交班方恢复</td>
+                <td>{{ expanded.proof.restored_to_owner.join('、') || '—' }}</td>
+              </tr>
+            </tbody>
+          </table>
+          <table style="margin-top: 10px">
+            <thead><tr><th>班次</th><th>回拨前在途</th><th>回拨后在途</th><th>在途计数（前 → 后）</th></tr></thead>
+            <tbody>
+              <tr>
+                <td>回拨方 #{{ expanded.proof.from_shift_id }}</td>
+                <td>{{ expanded.proof.from_before.join('、') || '空' }}</td>
+                <td>{{ expanded.proof.from_after.join('、') || '空' }}</td>
+                <td>{{ expanded.proof.before_count_from }} → {{ expanded.proof.after_count_from }}</td>
+              </tr>
+              <tr>
+                <td>接收方 #{{ expanded.proof.to_shift_id }}</td>
+                <td>{{ expanded.proof.to_before.join('、') || '空' }}</td>
+                <td>{{ expanded.proof.to_after.join('、') || '空' }}</td>
+                <td>{{ expanded.proof.before_count_to }} → {{ expanded.proof.after_count_to }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p v-else-if="expanded.status !== '已完成'" class="muted">
+          补偿单未成功完成，没有差证明（整单回滚，归属未变更）。
+        </p>
       </div>
     </div>
   </div>

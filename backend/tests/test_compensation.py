@@ -254,3 +254,220 @@ def test_dashboard_counts_active_compensation(client):
     assert done.status_code == 200, done.text
     dash = client.get("/api/dashboard").json()
     assert dash["进行中补偿"] == 0
+
+
+def test_compensation_moves_every_listed_key_atomically(client):
+    """回归：补偿半截——清单内全部键必须整单回到原交班方，一个都不能留在接班方。"""
+    a, b, c, batch_ids, _ = _prepare(501)
+    hid = _forward(client, a, b)
+    keys = [f"K501-{i}" for i in range(1, 5)]
+
+    created = client.post(
+        "/api/compensations", json={"handover_id": hid, "biz_keys": keys}
+    )
+    assert created.status_code == 200, created.text
+    cid = created.json()["id"]
+    assert created.json()["key_count"] == 4
+
+    done = client.post(f"/api/compensations/{cid}/complete")
+    assert done.status_code == 200, done.text
+    assert done.json()["status"] == "已完成"
+
+    # 四个键全部回到原交班方，且仍在途
+    assert all(_owner(bid) == (a, "在途") for bid in batch_ids)
+
+    # 接班方名下不再持有清单中的任何键
+    b_rows = client.get("/api/batches", params={"owner_shift_id": b}).json()
+    assert all(r["biz_key"] not in keys for r in b_rows)
+
+    # 清单逐键记录了回拨后归属
+    detail = client.get(f"/api/compensations/{cid}").json()
+    assert all(i["owner_shift_id_after"] == a for i in detail["items"])
+
+    # 差证明挂在补偿单上
+    proof = detail["proof"]
+    assert proof is not None
+    assert sorted(proof["moved_biz_keys"]) == sorted(keys)
+    assert sorted(proof["removed_from_holder"]) == sorted(keys)
+    assert sorted(proof["restored_to_owner"]) == sorted(keys)
+
+    # 同源：证明中的回拨后在途集合必须与 batches 表实时归属完全一致
+    with _db() as conn:
+        a_now = [
+            r["biz_key"]
+            for r in conn.execute(
+                "SELECT biz_key FROM batches WHERE owner_shift_id = ? AND status = '在途' ORDER BY biz_key",
+                (a,),
+            )
+        ]
+        b_now = [
+            r["biz_key"]
+            for r in conn.execute(
+                "SELECT biz_key FROM batches WHERE owner_shift_id = ? AND status = '在途' ORDER BY biz_key",
+                (b,),
+            )
+        ]
+    assert proof["from_after"] == b_now
+    assert proof["to_after"] == a_now
+    assert set(keys).isdisjoint(proof["from_after"])
+    assert set(keys) <= set(proof["to_after"])
+    assert proof["after_count_from"] == len(b_now)
+    assert proof["after_count_to"] == len(a_now)
+
+    # 按补偿单 id 查询的只读差证明接口
+    via_api = client.get(f"/api/compensations/{cid}/proof")
+    assert via_api.status_code == 200, via_api.text
+    body = via_api.json()
+    assert body["doc_type"] == "补偿回拨"
+    assert body["doc_no"] == f"补偿单#{cid}"
+    assert sorted(body["moved_biz_keys"]) == sorted(keys)
+
+    # 对账报告按整单清单计数，不再是半截
+    reports = client.get("/api/reconcile").json()
+    report = next(r for r in reports if r.get("compensation_id") == cid)
+    assert report["before_count"] == 4
+    assert len(report["detail"]["清单"]) == 4
+    assert sorted(report["detail"]["差证明"]["回拨键集合"]) == sorted(keys)
+
+
+def test_proof_readonly_endpoint_states(client):
+    """进行中/失败/不存在的补偿单没有差证明，只读接口返回 404。"""
+    a, b, c, batch_ids, _ = _prepare(701)
+    hid = _forward(client, a, b)
+    created = client.post(
+        "/api/compensations",
+        json={"handover_id": hid, "biz_keys": ["K701-1", "K701-2"]},
+    )
+    cid = created.json()["id"]
+
+    assert client.get(f"/api/compensations/{cid}/proof").status_code == 404
+    assert client.get("/api/compensations/999999/proof").status_code == 404
+
+    # 差证明接口只读：不允许写入动词
+    for method in ("post", "put", "patch", "delete"):
+        r = getattr(client, method)(f"/api/compensations/{cid}/proof")
+        assert r.status_code in (404, 405), (method, r.status_code)
+
+    # 完成后差证明才可用；同时避免进行中单据污染后续用例
+    done = client.post(f"/api/compensations/{cid}/complete")
+    assert done.status_code == 200, done.text
+    assert client.get(f"/api/compensations/{cid}/proof").status_code == 200
+
+
+def test_failed_compensation_persists_no_proof_and_rolls_back(client, monkeypatch):
+    from app.services import compensation as comp_svc
+
+    a, b, c, batch_ids, _ = _prepare(711)
+    hid = _forward(client, a, b)
+    created = client.post(
+        "/api/compensations",
+        json={"handover_id": hid, "biz_keys": ["K711-1", "K711-2", "K711-3"]},
+    )
+    cid = created.json()["id"]
+
+    def partial_then_fail(conn, ids, to_shift_id):
+        conn.execute(
+            "UPDATE batches SET owner_shift_id = ? WHERE id = ? AND status = '在途'",
+            (to_shift_id, ids[0]),
+        )
+        raise RuntimeError("注入失败")
+
+    monkeypatch.setattr(comp_svc, "_apply_compensation_updates", partial_then_fail)
+
+    failed = client.post(f"/api/compensations/{cid}/complete")
+    assert failed.status_code == 409
+    monkeypatch.undo()  # 后续清理动作必须走真实回拨逻辑
+
+    # 整单回滚：一个键都不能动
+    assert all(_owner(bid) == (b, "在途") for bid in batch_ids[:3])
+    # 失败单不落差证明、不落对账报告
+    assert client.get(f"/api/compensations/{cid}/proof").status_code == 404
+    with _db() as conn:
+        proofs = conn.execute(
+            "SELECT COUNT(*) AS c FROM compensation_proofs WHERE compensation_id = ?",
+            (cid,),
+        ).fetchone()["c"]
+        reports = conn.execute(
+            "SELECT COUNT(*) AS c FROM reconcile_reports WHERE compensation_id = ?",
+            (cid,),
+        ).fetchone()["c"]
+        afters = conn.execute(
+            "SELECT COUNT(*) AS c FROM compensation_items WHERE compensation_id = ? AND owner_shift_id_after IS NOT NULL",
+            (cid,),
+        ).fetchone()["c"]
+        status = conn.execute(
+            "SELECT status FROM compensations WHERE id = ?", (cid,)
+        ).fetchone()["status"]
+    assert proofs == 0
+    assert reports == 0
+    assert afters == 0
+    assert status == "失败"
+
+    # 失败单不能再次完成（保持失败终态，不残留进行中单据）
+    again = client.post(f"/api/compensations/{cid}/complete")
+    assert again.status_code == 400
+
+
+def test_manual_owner_change_rejected_while_docs_active(client):
+    """存在进行中交班/补偿时手工改归属必须拒绝；无进行中单据时同样不提供该入口。"""
+    # 场景一：进行中正向交班期间
+    a, b, c, batch_ids, _ = _prepare(601)
+    started = client.post(
+        "/api/handovers/start", json={"from_shift_id": a, "to_shift_id": b}
+    )
+    assert started.status_code == 200, started.text
+    fhid = started.json()["id"]
+    for method in ("put", "patch", "post"):
+        r = getattr(client, method)(
+            f"/api/batches/{batch_ids[0]}", json={"owner_shift_id": c}
+        )
+        assert r.status_code in (404, 405), (method, r.status_code)
+    assert _owner(batch_ids[0]) == (a, "在途")
+    assert client.post(f"/api/handovers/{fhid}/complete").status_code == 200
+
+    # 场景二：进行中补偿回拨期间（独立班次，不受场景一归属变化影响）
+    a2, b2, c2, batch_ids2, _ = _prepare(611)
+    hid2 = _forward(client, a2, b2)
+    created = client.post(
+        "/api/compensations", json={"handover_id": hid2, "biz_keys": ["K611-1"]}
+    )
+    assert created.status_code == 200, created.text
+    cid = created.json()["id"]
+    for method in ("put", "patch", "post"):
+        r = getattr(client, method)(
+            f"/api/batches/{batch_ids2[1]}", json={"owner_shift_id": c2}
+        )
+        assert r.status_code in (404, 405), (method, r.status_code)
+    assert _owner(batch_ids2[1]) == (b2, "在途")
+    assert client.post(f"/api/compensations/{cid}/complete").status_code == 200
+    assert _owner(batch_ids2[0]) == (a2, "在途")
+
+    # 无任何进行中单据：系统依旧不提供手工改归属入口
+    r = client.put(f"/api/batches/{batch_ids2[2]}", json={"owner_shift_id": c2})
+    assert r.status_code in (404, 405)
+    assert _owner(batch_ids2[2]) == (b2, "在途")
+
+
+
+def test_records_carry_proof_fields(client):
+    records = client.get("/api/records").json()
+    forward = [r for r in records if r["kind"] == "forward"]
+    assert forward and all(r["proof"] is None for r in forward)
+
+    comp_done = [
+        r for r in records if r["kind"] == "compensation" and r["status"] == "已完成"
+    ]
+    assert comp_done
+    row = comp_done[0]
+    proof = row["proof"]
+    assert proof is not None
+    assert proof["回拨键集合"]
+    assert proof["接班方不再持有"] == proof["回拨键集合"]
+    assert proof["原交班方恢复"] == proof["回拨键集合"]
+    assert len(proof["回拨方在途差"]) == 2
+    assert len(proof["接收方在途差"]) == 2
+
+    # 进行中/失败的补偿单记录不应带差证明
+    comp_open = [r for r in records if r["kind"] == "compensation" and r["status"] != "已完成"]
+    assert all(r["proof"] is None for r in comp_open)
+

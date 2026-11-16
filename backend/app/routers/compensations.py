@@ -28,6 +28,12 @@ def get_one(compensation_id: int):
     return svc.get_compensation(compensation_id)
 
 
+@router.get("/{compensation_id}/proof")
+def get_proof(compensation_id: int):
+    """只读：按补偿单 id 查询补偿前后在途差证明。"""
+    return svc.get_proof(compensation_id)
+
+
 @router.post("")
 def create(body: CreateBody):
     keys = body.biz_keys or body.keys or []

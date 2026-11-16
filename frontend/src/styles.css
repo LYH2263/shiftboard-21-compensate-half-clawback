@@ -210,6 +210,13 @@ input {
 }
 .tag.on { border-color: var(--accent); color: var(--accent); }
 .muted { color: var(--muted); font-size: 12px; }
+.proof {
+  margin-top: 12px;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.03);
+}
+.proof h2 { margin-top: 0; }
 
 @media (max-width: 800px) {
   .topbar, .content, .ribbon { padding-left: 16px; padding-right: 16px; }

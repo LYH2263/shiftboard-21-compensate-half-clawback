@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from fastapi import HTTPException
 
 from app.db import connect, rows_to_dicts, transaction
+from app.services import handover as handover_svc
 
 DOC_TYPE = "补偿回拨"
 
@@ -20,6 +21,28 @@ def _now() -> str:
 
 def _conflict_message(conflict: CompensationConflict) -> str:
     return f"{conflict}；整单已回滚，业务键归属未发生任何变更"
+
+
+def _load_proof(conn, compensation_id: int) -> dict | None:
+    """读取补偿前后在途差证明；进行中/失败单没有证明。"""
+    row = conn.execute(
+        "SELECT * FROM compensation_proofs WHERE compensation_id = ?",
+        (compensation_id,),
+    ).fetchone()
+    if not row:
+        return None
+    proof = dict(row)
+    for column in [
+        "moved_biz_keys_json",
+        "from_before_json",
+        "from_after_json",
+        "to_before_json",
+        "to_after_json",
+        "removed_from_holder_json",
+        "restored_to_owner_json",
+    ]:
+        proof[column[: -len("_json")]] = json.loads(proof.pop(column))
+    return proof
 
 
 def _load(conn, compensation_id: int) -> dict:
@@ -53,6 +76,7 @@ def _load(conn, compensation_id: int) -> dict:
         (compensation_id,),
     ).fetchall()
     out["items"] = rows_to_dicts(items)
+    out["proof"] = _load_proof(conn, compensation_id)
     out["doc_type"] = DOC_TYPE
     out["doc_no"] = f"补偿单#{compensation_id}"
     out["related_doc_no"] = f"交班单#{out['handover_id']}"
@@ -61,31 +85,22 @@ def _load(conn, compensation_id: int) -> dict:
 
 def list_compensations(status: str | None = None) -> list[dict]:
     with connect() as conn:
+        sql = """
+            SELECT c.*,
+                   fs.name AS from_shift_name,
+                   ts.name AS to_shift_name
+            FROM compensations c
+            JOIN shifts fs ON fs.id = c.from_shift_id
+            JOIN shifts ts ON ts.id = c.to_shift_id
+            {where}
+            ORDER BY c.id DESC
+        """
+        params: tuple = ()
         if status is None:
-            rows = conn.execute(
-                """
-                SELECT c.*,
-                       fs.name AS from_shift_name,
-                       ts.name AS to_shift_name
-                FROM compensations c
-                JOIN shifts fs ON fs.id = c.from_shift_id
-                JOIN shifts ts ON ts.id = c.to_shift_id
-                ORDER BY c.id DESC
-                """
-            ).fetchall()
+            rows = conn.execute(sql.format(where="")).fetchall()
         else:
             rows = conn.execute(
-                """
-                SELECT c.*,
-                       fs.name AS from_shift_name,
-                       ts.name AS to_shift_name
-                FROM compensations c
-                JOIN shifts fs ON fs.id = c.from_shift_id
-                JOIN shifts ts ON ts.id = c.to_shift_id
-                WHERE c.status = ?
-                ORDER BY c.id DESC
-                """,
-                (status,),
+                sql.format(where="WHERE c.status = ?"), (status,)
             ).fetchall()
         out = []
         for r in rows:
@@ -100,6 +115,22 @@ def list_compensations(status: str | None = None) -> list[dict]:
 def get_compensation(compensation_id: int) -> dict:
     with connect() as conn:
         return _load(conn, compensation_id)
+
+
+def get_proof(compensation_id: int) -> dict:
+    """按补偿单 id 查询差证明的只读接口支撑；无证明时 404。"""
+    with connect() as conn:
+        exists = conn.execute(
+            "SELECT 1 FROM compensations WHERE id = ?", (compensation_id,)
+        ).fetchone()
+        if not exists:
+            raise HTTPException(404, "补偿单不存在")
+        proof = _load_proof(conn, compensation_id)
+        if proof is None:
+            raise HTTPException(404, "补偿单尚未成功完成，没有差证明")
+        proof["doc_type"] = DOC_TYPE
+        proof["doc_no"] = f"补偿单#{compensation_id}"
+        return proof
 
 
 def list_compensable(handover_id: int) -> list[dict]:
@@ -128,20 +159,16 @@ def list_compensable(handover_id: int) -> list[dict]:
 
 def _assert_exclusive(conn) -> None:
     """全局互斥：进行中的补偿与进行中的正向交班不能并存。"""
-    active_handover = conn.execute(
-        "SELECT id FROM handovers WHERE status = '进行中' LIMIT 1"
-    ).fetchone()
-    if active_handover:
+    active = handover_svc.active_doc(conn)
+    if active:
+        if active["kind"] == "正向交班":
+            raise HTTPException(
+                409,
+                f"{active['doc_no']} 正在进行中，禁止同时办理补偿回拨",
+            )
         raise HTTPException(
             409,
-            f"交班单#{active_handover['id']} 正在进行中，禁止同时办理补偿回拨",
-        )
-    active_comp = conn.execute(
-        "SELECT id FROM compensations WHERE status = '进行中' LIMIT 1"
-    ).fetchone()
-    if active_comp:
-        raise HTTPException(
-            409, f"补偿单#{active_comp['id']} 正在进行中，禁止同时办理正向交班或补偿"
+            f"{active['doc_no']} 正在进行中，禁止同时办理正向交班或补偿",
         )
 
 
@@ -253,9 +280,11 @@ def create_compensation(handover_id: int, biz_keys: list[str], reason: str = "")
 
 
 def _apply_compensation_updates(conn, batch_ids: list[int], to_shift_id: int) -> int:
-    """回拨写入的唯一出口；返回实际更新的行数。
+    """回拨写入的唯一出口；一次性更新清单内全部批次，返回实际更新的行数。
 
     单独成函数是为了让测试可以替换它来验证「部分更新后失败」也会整单回滚。
+    调用方在同一 BEGIN IMMEDIATE 事务内已校验全部批次仍在途且属回拨方，
+    SQLite 单写锁保证校验与写入之间没有其他事务能改归属。
     """
     placeholders = ",".join("?" * len(batch_ids))
     cur = conn.execute(
@@ -357,8 +386,10 @@ def complete_compensation(compensation_id: int) -> dict:
 
             from_id = comp["from_shift_id"]
             to_id = comp["to_shift_id"]
-            batch_ids = [it["batch_id"] for it in items][: max(1, len(items) // 2)]
+            # 整单原子：清单内指定键全部回拨，不允许只回拨其中一部分。
+            batch_ids = [it["batch_id"] for it in items]
             n = len(batch_ids)
+            item_by_id = {it["batch_id"]: it for it in items}
 
             before_from = conn.execute(
                 "SELECT COUNT(*) AS c FROM batches WHERE owner_shift_id = ? AND status = '在途'",
@@ -423,26 +454,86 @@ def complete_compensation(compensation_id: int) -> dict:
                 "to": _batch_ids_of_shift(conn, to_id),
             }
 
-            # 同源校验：报告里的前后在途集合必须与补偿清单逐键吻合，
+            # 同源校验：回拨前后在途集合差必须与补偿清单逐键吻合，
             # 不能出现「清单说回拨了、集合里却没动」的口径分叉。
             moved_ids = set(batch_ids)
+            removed_ids = before_ids["from"] - after_ids["from"]
+            restored_ids = after_ids["to"] - before_ids["to"]
             if not moved_ids <= before_ids["from"]:
                 raise CompensationConflict("清单批次不在回拨方回拨前的在途集合内")
+            if removed_ids != moved_ids:
+                raise CompensationConflict("回拨方在途集合差与清单不一致")
             if after_ids["from"] != before_ids["from"] - moved_ids:
                 raise CompensationConflict("回拨方在途集合与清单不一致")
+            if restored_ids != moved_ids:
+                raise CompensationConflict("接收方在途集合差与清单不一致")
             if after_ids["to"] != before_ids["to"] | moved_ids:
                 raise CompensationConflict("接收方在途集合与清单不一致")
 
+            moved_keys = sorted(item_by_id[bid]["biz_key"] for bid in moved_ids)
+            removed_keys = sorted(item_by_id[bid]["biz_key"] for bid in removed_ids)
+            restored_keys = sorted(item_by_id[bid]["biz_key"] for bid in restored_ids)
+
+            # 清单回拨后归属与单据状态、差证明、对账报告全部在同一事务内落库：
+            # 任一步失败整体回滚，不会出现状态已完成但归属没动（或反之）。
+            conn.execute(
+                """
+                UPDATE compensation_items
+                SET owner_shift_id_after = ?
+                WHERE compensation_id = ?
+                """,
+                (to_id, compensation_id),
+            )
             conn.execute(
                 "UPDATE compensations SET status = '已完成', finished_at = ? WHERE id = ?",
                 (_now(), compensation_id),
             )
 
+            # 持久化补偿前后在途差证明：回拨键集合、接班方不再持有、原交班方恢复。
+            conn.execute(
+                """
+                INSERT INTO compensation_proofs(
+                  compensation_id, from_shift_id, to_shift_id,
+                  moved_biz_keys_json,
+                  from_before_json, from_after_json,
+                  to_before_json, to_after_json,
+                  removed_from_holder_json, restored_to_owner_json,
+                  before_count_from, after_count_from,
+                  before_count_to, after_count_to, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    compensation_id, from_id, to_id,
+                    json.dumps(moved_keys, ensure_ascii=False),
+                    json.dumps(before_sets["from"], ensure_ascii=False),
+                    json.dumps(after_sets["from"], ensure_ascii=False),
+                    json.dumps(before_sets["to"], ensure_ascii=False),
+                    json.dumps(after_sets["to"], ensure_ascii=False),
+                    json.dumps(removed_keys, ensure_ascii=False),
+                    json.dumps(restored_keys, ensure_ascii=False),
+                    before_from, after_from, before_to, after_to,
+                    _now(),
+                ),
+            )
+
             detail = {
                 "单据类型": DOC_TYPE,
                 "原交班单": f"交班单#{comp['handover_id']}",
-                "回拨方": {"班次": comp["from_shift_id"], "回拨前在途": before_sets["from"], "回拨后在途": after_sets["from"]},
-                "接收方": {"班次": comp["to_shift_id"], "回拨前在途": before_sets["to"], "回拨后在途": after_sets["to"]},
+                "差证明": {
+                    "回拨键集合": moved_keys,
+                    "回拨方": {
+                        "班次": from_id,
+                        "回拨前在途": before_sets["from"],
+                        "回拨后在途": after_sets["from"],
+                        "不再持有": removed_keys,
+                    },
+                    "接收方": {
+                        "班次": to_id,
+                        "回拨前在途": before_sets["to"],
+                        "回拨后在途": after_sets["to"],
+                        "恢复持有": restored_keys,
+                    },
+                },
                 "清单": [
                     {
                         "业务键": it["biz_key"],

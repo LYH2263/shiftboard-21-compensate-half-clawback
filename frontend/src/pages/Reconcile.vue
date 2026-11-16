@@ -80,6 +80,41 @@ function toggle(r) {
                 </tr>
               </tbody>
             </table>
+            <div v-if="r.detail.差证明" class="proof" style="margin-top: 12px">
+              <h2>补偿前后在途差证明（与批次归属同源）</h2>
+              <table>
+                <thead><tr><th>差证明字段</th><th>业务键集合</th></tr></thead>
+                <tbody>
+                  <tr>
+                    <td>回拨键集合</td>
+                    <td>{{ (r.detail.差证明.回拨键集合 || []).join('、') }}</td>
+                  </tr>
+                  <tr>
+                    <td>接班方不再持有</td>
+                    <td>{{ (r.detail.差证明.回拨方.不再持有 || []).join('、') }}</td>
+                  </tr>
+                  <tr>
+                    <td>原交班方恢复</td>
+                    <td>{{ (r.detail.差证明.接收方.恢复持有 || []).join('、') }}</td>
+                  </tr>
+                </tbody>
+              </table>
+              <table style="margin-top: 10px">
+                <thead><tr><th>班次侧</th><th>回拨前在途</th><th>回拨后在途</th></tr></thead>
+                <tbody>
+                  <tr>
+                    <td>回拨方（接班方）#{{ r.detail.差证明.回拨方.班次 }}</td>
+                    <td>{{ (r.detail.差证明.回拨方.回拨前在途 || []).join('、') || '空' }}</td>
+                    <td>{{ (r.detail.差证明.回拨方.回拨后在途 || []).join('、') || '空' }}</td>
+                  </tr>
+                  <tr>
+                    <td>接收方（原交班方）#{{ r.detail.差证明.接收方.班次 }}</td>
+                    <td>{{ (r.detail.差证明.接收方.回拨前在途 || []).join('、') || '空' }}</td>
+                    <td>{{ (r.detail.差证明.接收方.回拨后在途 || []).join('、') || '空' }}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
             <p class="msg">
               回拨前计数：{{ r.detail.回拨前计数.回拨方 }} / {{ r.detail.回拨前计数.接收方 }} ·
               回拨后计数：{{ r.detail.回拨后计数.回拨方 }} / {{ r.detail.回拨后计数.接收方 }}

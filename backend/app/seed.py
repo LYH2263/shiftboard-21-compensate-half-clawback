@@ -53,7 +53,28 @@ CREATE TABLE IF NOT EXISTS compensation_items (
   biz_key TEXT NOT NULL,
   title TEXT NOT NULL DEFAULT '',
   owner_shift_id_before INTEGER NOT NULL,
+  owner_shift_id_after INTEGER,
   PRIMARY KEY (compensation_id, batch_id)
+);
+-- 补偿前后在途差证明：与回拨写入同一事务落库，数据直接取自 batches 归属，
+-- 与批次归属同源，补偿单成功完成后才有且仅有一行。
+CREATE TABLE IF NOT EXISTS compensation_proofs (
+  id INTEGER PRIMARY KEY,
+  compensation_id INTEGER NOT NULL UNIQUE REFERENCES compensations(id),
+  from_shift_id INTEGER NOT NULL REFERENCES shifts(id),
+  to_shift_id INTEGER NOT NULL REFERENCES shifts(id),
+  moved_biz_keys_json TEXT NOT NULL,
+  from_before_json TEXT NOT NULL,
+  from_after_json TEXT NOT NULL,
+  to_before_json TEXT NOT NULL,
+  to_after_json TEXT NOT NULL,
+  removed_from_holder_json TEXT NOT NULL,
+  restored_to_owner_json TEXT NOT NULL,
+  before_count_from INTEGER NOT NULL,
+  after_count_from INTEGER NOT NULL,
+  before_count_to INTEGER NOT NULL,
+  after_count_to INTEGER NOT NULL,
+  created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS reconcile_reports (
   id INTEGER PRIMARY KEY,
@@ -74,6 +95,9 @@ MIGRATIONS = {
     "reconcile_reports": {
         "doc_type": "TEXT NOT NULL DEFAULT '正向交班'",
         "compensation_id": "INTEGER REFERENCES compensations(id)",
+    },
+    "compensation_items": {
+        "owner_shift_id_after": "INTEGER",
     },
 }
 

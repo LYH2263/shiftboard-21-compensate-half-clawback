@@ -1,13 +1,8 @@
 from fastapi import APIRouter, Query
-from pydantic import BaseModel
 
 from app.services import handover as svc
 
 router = APIRouter(prefix="/batches", tags=["在途批次"])
-
-
-class OwnerBody(BaseModel):
-    owner_shift_id: int
 
 
 @router.get("")
@@ -15,15 +10,8 @@ def get_batches(owner_shift_id: int | None = Query(default=None)):
     return svc.list_batches(owner_shift_id)
 
 
-@router.put("/{batch_id}")
-def set_owner(batch_id: int, body: OwnerBody):
-    from app.db import connect
-
-    with connect() as conn:
-        conn.execute(
-            "UPDATE batches SET owner_shift_id = ? WHERE id = ?",
-            (body.owner_shift_id, batch_id),
-        )
-        conn.commit()
-        row = conn.execute("SELECT * FROM batches WHERE id = ?", (batch_id,)).fetchone()
-    return dict(row) if row else {}
+# 归属（batches.owner_shift_id）只能由两条单据链路写入：
+#   1. 正向交班完成（handover.complete_handover）
+#   2. 补偿回拨完成（compensation.complete_compensation）
+# 系统不提供手工改归属接口；任何 PUT/PATCH/POST /api/batches/{id} 都会被
+# 路由层拒绝（405/404），从入口上杜绝进行中单据期间私下改归属绕过补偿。
